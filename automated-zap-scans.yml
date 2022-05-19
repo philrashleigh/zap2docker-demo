@@ -1,0 +1,200 @@
+name: $(Date:yyyyMMdd)
+trigger: none
+pr: none
+schedules:
+
+- cron: "0 0 * * 0" # Use CRON to run on a schedule (currently once a week at midnight on Sunday)
+  displayName: Weekly OWASP Vulnerability Check  
+  branches:
+    include:
+    - main
+jobs:
+
+- job: OWASP_ZAP_Scans
+  displayName: Run OWASP ZAP Scans
+  pool: 
+    # Any image or agent supporting docker, bash and powerhsell should work fine
+    vmImage: ubuntu-latest
+  workspace:
+    clean: all
+
+  steps:
+
+    - task: PowerShell@2
+      inputs:
+        targetType: 'inline'
+        script: |
+          # Create the working temp directory
+          New-Item -Path "$(Agent.TempDirectory)" -Name "$(Build.BuildId)" -ItemType "directory"
+
+          $NewDirectoryFullPath = "$(Agent.TempDirectory)/$(Build.BuildId)"
+
+          # Allow all write permissions so it can be writen to by zap2docker
+          chmod a+w "$NewDirectoryFullPath"
+
+          # Create a variable for the new directory for use in other steps
+          Write-Host "##vso[task.setvariable variable=workingTempDirectory]$NewDirectoryFullPath"
+
+          echo "Created temp working folder at $NewDirectoryFullPath"
+      displayName: 'Initialize: Create Temporary Working Directory'
+
+    - task: PowerShell@2
+      inputs:
+        targetType: 'inline'
+        script: |
+          # See https://docs.nunit.org/articles/nunit/technical-notes/usage/Test-Result-XML-Format.html for NUnit 3.0 XML ref
+          # See https://docs.microsoft.com/en-us/azure/devops/pipelines/tasks/test/publish-test-results?view=azure-devops&tabs=nunit3%2Cyaml#arguments for how this is translated to DevOps
+          # <!-- XML Comments --> help provide some context
+          $FileContents = '<?xml version="1.0" encoding="utf-8"?>
+          <xsl:stylesheet version="2.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:msxsl="urn:schemas-microsoft-com:xslt" exclude-result-prefixes="msxsl">
+            <xsl:output method="xml" indent="yes"/>
+        
+            <xsl:variable name="NumberOfItems" select="count(OWASPZAPReport/site/alerts/alertitem)"/>
+
+            <!-- Treat "False Positive" as skip -->
+            <!-- confidence 0 for false positive - see https://javadoc.io/doc/org.zaproxy/zap-clientapi/1.7.0/org/zaproxy/clientapi/core/Alert.Confidence.html#FalsePositive -->
+            <xsl:variable name="NumberOfSkippedtems" select="count(OWASPZAPReport/site/alerts/alertitem[confidence=0])"/>
+            <xsl:variable name="NumberOfFailedItems" select="$NumberOfItems - $NumberOfSkippedtems"/>
+
+            <xsl:variable name="generatedDateTime" select="OWASPZAPReport/generated"/>
+  
+            <xsl:template match="/">
+              <test-run id="1" name="OWASP" fullname="OWASP" testcasecount="{$NumberOfItems}" result="Failed" total="{$NumberOfItems}" passed="0" failed="{$NumberOfFailedItems}" inconclusive="0" skipped="{$NumberOfSkippedtems}" asserts="0" start-time="{$generatedDateTime}" end-time="{$generatedDateTime}" duration="0">
+                <test-suite type="Assembly" id="0-1000" name="OWASP" fullname="OWASP" testcasecount="{$NumberOfItems}" result="Failed" total="{$NumberOfItems}" passed="0" failed="{$NumberOfFailedItems}" inconclusive="0" skipped="{$NumberOfSkippedtems}" asserts="0">
+                  <test-suite type="TestFixture" id="0-1001" testcasecount="{$NumberOfItems}" result="Failed" total="{$NumberOfItems}" passed="0" failed="{$NumberOfFailedItems}" inconclusive="0" skipped="{$NumberOfSkippedtems}" asserts="0">
+
+                    <!-- Foreach alert in original report -->
+                    <xsl:for-each select="OWASPZAPReport/site/alerts/alertitem">
+                 
+                      <test-case id="{pluginid}" name="{name}" fullname="{name}" result="Failed">
+                        <failure>
+                            <message>
+                            <xsl:text>Description:</xsl:text>
+                            <xsl:text>&#xa;</xsl:text>
+                            <xsl:value-of select="desc"/>
+                            <xsl:text>&#xa;</xsl:text>
+                            <xsl:text>&#xa;</xsl:text>
+                            <xsl:text>Solution:</xsl:text>
+                            <xsl:value-of select="solution"/>
+                            </message>
+                            <stack-trace>
+                            <xsl:for-each select="instances/instance">
+                                <xsl:value-of select="uri"/>
+                                <xsl:text>&#160;</xsl:text>
+                                <xsl:value-of select="method"/>
+                                <xsl:text>&#160;</xsl:text>
+                                <xsl:value-of select="param"/>
+                                <xsl:text>&#xa;</xsl:text>
+                            </xsl:for-each>
+                            </stack-trace>
+                        </failure>
+                      </test-case>
+                          
+                    </xsl:for-each>
+                  </test-suite>
+                </test-suite>
+              </test-run>
+            </xsl:template>
+          </xsl:stylesheet>'
+      
+          # Write to file
+          $FileContents | Out-File -FilePath "$(workingTempDirectory)/OWASPToNUnit3.xslt"
+      displayName: 'Initialize: Create OWASP to NUnit XSLT Transformation'
+
+    - task: Bash@3  
+      inputs:
+        targetType: 'inline'
+        script: docker pull owasp/zap2docker-stable:latest
+      displayName: 'Pull: Download zap2Docker Image'
+
+    - task: Bash@3
+      inputs:      
+        targetType: 'inline'
+        script: |
+          docker run --rm --mount type=bind,source="$(workingTempDirectory)",target=/zap/wrk/ owasp/zap2docker-stable zap-baseline.py -t "https://owasp-zap-demo-ui.azurewebsites.net" -x UI-Report.xml -r UI-Report.html
+
+          exit 0
+      displayName: 'Run: UI Application Scan'
+
+    - task: Bash@3
+      inputs:      
+        targetType: 'inline'
+        script: |
+          docker run --rm --mount type=bind,source="$(workingTempDirectory)",target=/zap/wrk/ --env ZAP_AUTH_HEADER="custom-header-name" --env ZAP_AUTH_HEADER_VALUE="my-secret-personal-access-token" -t owasp/zap2docker-stable zap-api-scan.py -t "https://owasp-zap-demo-api.azurewebsites.net/swagger/v1/swagger.json" -f openapi -x API-Report.xml -r API-Report.html
+
+          exit 0
+      displayName: 'Run: API Application Scan'
+
+    - task: PowerShell@2
+      inputs:
+        targetType: 'inline'
+        script: |
+          $XslTransform = New-Object System.Xml.Xsl.XslCompiledTransform
+          $XslPath = "$(workingTempDirectory)/OWASPToNUnit3.xslt"
+          $XslTransform.Load($XslPath)
+
+          $XmlInputPath = "$(workingTempDirectory)/UI-Report.xml"
+          $XmlOutputPath = "$(workingTempDirectory)/NUnit-UI-Report.xml"
+          
+          $XslTransform.Transform($XmlInputPath, $XmlOutputPath)
+          
+          $XmlInputPath = "$(workingTempDirectory)/API-Report.xml"
+          $XmlOutputPath = "$(workingTempDirectory)/NUnit-API-Report.xml"
+          
+          $XslTransform.Transform($XmlInputPath, $XmlOutputPath)
+      displayName: 'Transform: Run OWASP to NUnit XSLT Transformation'
+       
+    - task: PublishBuildArtifacts@1
+      inputs:
+        pathtoPublish: '$(workingTempDirectory)/UI-Report.html'
+        artifactName: 'ZAP Reports'
+        publishLocation: 'Container'
+      displayName: 'Publish: Publish UI Report as Build Artifact'
+    
+    - task: PublishBuildArtifacts@1
+      inputs:
+        pathtoPublish: '$(workingTempDirectory)/API-Report.html'
+        artifactName: 'ZAP Reports'
+        publishLocation: 'Container'
+      displayName: 'Publish: Publish API Report as Build Artifact'
+
+    - task: PublishTestResults@2
+      inputs:
+        testRunTitle: 'UI'
+        testRunner: 'NUnit'
+        testResultsFiles: '**/NUnit-UI-Report.xml'
+        searchFolder: '$(workingTempDirectory)'
+        publishRunAttachments: false    
+      displayName: 'Publish: Publish UI Scan Results As Test Results'
+
+    - task: PublishTestResults@2
+      inputs:
+        testRunTitle: 'API'
+        testRunner: 'NUnit'
+        testResultsFiles: '**/NUnit-API-Report.xml'
+        searchFolder: '$(workingTempDirectory)'
+        publishRunAttachments: false    
+      displayName: 'Publish: Publish API Scan Results As Test Results'
+
+    - task: PowerShell@2
+      inputs:
+        targetType: 'inline'
+        script: |
+          # If the scan resulted in alerts which are not allow-listed, set a flag so we can fail the pipeline later
+          # <confidence>0</confidence> in <alertitem> if alert configured as false positive
+          $UIAlerts = Select-Xml -Path "$(workingTempDirectory)/UI-Report.xml" -XPath "OWASPZAPReport/site/alerts/alertitem"
+          $APIAlerts = Select-Xml -Path "$(workingTempDirectory)/API-Report.xml" -XPath "OWASPZAPReport/site/alerts/alertitem"
+
+          if (($UIAlerts.Count -gt 0) -or ($APIAlerts.Count -gt 0)) {
+              exit 1
+          }
+        failOnStderr: true
+      displayName: 'Pass/Fail: Fail if there are any alerts'
+
+    - task: DeleteFiles@1
+      inputs:
+        sourceFolder: $(workingTempDirectory)
+        contents: '**/*'
+        removeSourceFolder: true
+      condition: always() # this step will always run, even if the pipeline is cancelled
+      displayName: 'Finalize: Remove Temporary Directory'
